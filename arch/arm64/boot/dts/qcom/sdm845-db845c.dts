@@ -455,9 +455,10 @@
 	status = "okay";
 	clock-frequency = <400000>;
 
-	hdmi-bridge@3b {
-		compatible = "lt,lt9611";
+	lt9611_codec: hdmi-bridge@3b {
+		compatible = "lontium,lt9611";
 		reg = <0x3b>;
+		#sound-dai-cells = <1>;
 
 		interrupts-extended = <&tlmm 84 IRQ_TYPE_EDGE_FALLING>;
 
