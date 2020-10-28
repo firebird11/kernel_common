@@ -1458,6 +1458,9 @@ int usb_suspend(struct device *dev, pm_message_t msg)
 	struct usb_device	*udev = to_usb_device(dev);
 	int r;
 
+	if (udev->bus->skip_resume && udev->state == USB_STATE_SUSPENDED)
+		return 0;
+
 	unbind_no_pm_drivers_interfaces(udev);
 
 	/* From now on we are sure all drivers support suspend/resume
@@ -1493,6 +1496,15 @@ int usb_resume(struct device *dev, pm_message_t msg)
 {
 	struct usb_device	*udev = to_usb_device(dev);
 	int			status;
+
+	/*
+	 * Some buses would like to keep their devices in suspend
+	 * state after system resume.  Their resume happen when
+	 * a remote wakeup is detected or interface driver start
+	 * I/O.
+	 */
+	if (udev->bus->skip_resume)
+		return 0;
 
 	/* For all calls, take the device back to full power and
 	 * tell the PM core in case it was autosuspended previously.
@@ -1792,6 +1804,14 @@ static int autosuspend_check(struct usb_device *udev)
 			 * or else their drivers don't support autosuspend
 			 * and so they are permanently active.
 			 */
+/* @bsp, 2019/09/18 usb & PD porting */
+/* Avoid crash due to broken fs on otg */
+			if (!intf) {
+				dev_err(&udev->dev, "%s intf is NULL\n",
+						__func__);
+				return -EIO;
+			}
+
 			if (intf->dev.power.disable_depth)
 				continue;
 			if (atomic_read(&intf->dev.power.usage_count) > 0)

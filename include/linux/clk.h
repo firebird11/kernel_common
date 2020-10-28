@@ -629,6 +629,15 @@ struct clk *clk_get_parent(struct clk *clk);
  */
 struct clk *clk_get_sys(const char *dev_id, const char *con_id);
 
+/**
+ * clk_set_flags - set the custom HW specific flags for this clock
+ * @clk: clock source
+ * @flags: custom flags which would be hardware specific.
+ *
+ * Returns success 0 or negative errno.
+ */
+int clk_set_flags(struct clk *clk, unsigned long flags);
+
 #else /* !CONFIG_HAVE_CLK */
 
 static inline struct clk *clk_get(struct device *dev, const char *id)
@@ -728,6 +737,11 @@ static inline struct clk *clk_get_sys(const char *dev_id, const char *con_id)
 {
 	return NULL;
 }
+
+static inline int clk_set_flags(struct clk *clk, unsigned long flags)
+{
+	return 0;
+}
 #endif
 
 /* clk_prepare_enable helps cases using clk_enable in non-atomic context. */
@@ -773,6 +787,10 @@ static inline void clk_bulk_disable_unprepare(int num_clks,
 	clk_bulk_disable(num_clks, clks);
 	clk_bulk_unprepare(num_clks, clks);
 }
+
+#ifdef CONFIG_HOUSTON
+extern void clk_get_ddr_freq(u64 *val);
+#endif
 
 #if defined(CONFIG_OF) && defined(CONFIG_COMMON_CLK)
 struct clk *of_clk_get(struct device_node *np, int index);

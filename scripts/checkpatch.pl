@@ -15,6 +15,13 @@ use Cwd 'abs_path';
 use Term::ANSIColor qw(:constants);
 use Encode qw(decode encode);
 
+use constant BEFORE_SHORTTEXT => 0;
+use constant IN_SHORTTEXT_BLANKLINE => 1;
+use constant IN_SHORTTEXT => 2;
+use constant AFTER_SHORTTEXT => 3;
+use constant CHECK_NEXT_SHORTTEXT => 4;
+use constant SHORTTEXT_LIMIT => 120;
+
 my $P = $0;
 my $D = dirname(abs_path($P));
 
@@ -51,7 +58,7 @@ my %ignore_type = ();
 my @ignore = ();
 my $help = 0;
 my $configuration_file = ".checkpatch.conf";
-my $max_line_length = 80;
+my $max_line_length = 120;
 my $ignore_perl_version = 0;
 my $minimum_perl_version = 5.10.0;
 my $min_conf_desc_length = 4;
@@ -468,6 +475,7 @@ our $logFunctions = qr{(?x:
 
 our $signature_tags = qr{(?xi:
 	Signed-off-by:|
+	Co-developed-by:|
 	Acked-by:|
 	Tested-by:|
 	Reviewed-by:|
@@ -2203,6 +2211,33 @@ sub tabify {
 	return "$leading";
 }
 
+sub cleanup_continuation_headers {
+	# Collapse any header-continuation lines into a single line so they
+	# can be parsed meaningfully, as the parser only has one line
+	# of context to work with.
+	my $again;
+	do {
+		$again = 0;
+		foreach my $n (0 .. scalar(@rawlines) - 2) {
+			if ($rawlines[$n]=~/^\s*$/) {
+				# A blank line means there's no more chance
+				# of finding headers.  Shortcut to done.
+				return;
+			}
+			if ($rawlines[$n]=~/^[\x21-\x39\x3b-\x7e]+:/ &&
+			    $rawlines[$n+1]=~/^\s+/) {
+				# Continuation header.  Collapse it.
+				my $line = splice @rawlines, $n+1, 1;
+				$line=~s/^\s+/ /;
+				$rawlines[$n] .= $line;
+				# We've 'destabilized' the list, so restart.
+				$again = 1;
+				last;
+			}
+		}
+	} while ($again);
+}
+
 sub pos_last_openparen {
 	my ($line) = @_;
 
@@ -2241,6 +2276,8 @@ sub process {
 	my $prevrawline="";
 	my $stashline="";
 	my $stashrawline="";
+	my $subjectline="";
+	my $sublinenr="";
 
 	my $length;
 	my $indent;
@@ -2300,11 +2337,16 @@ sub process {
 	my $setup_docs = 0;
 
 	my $camelcase_file_seeded = 0;
+	my $shorttext = BEFORE_SHORTTEXT;
+	my $shorttext_exspc = 0;
+	my $commit_text_present = 0;
 
 	my $checklicenseline = 1;
 
 	sanitise_line_reset();
+	cleanup_continuation_headers();
 	my $line;
+
 	foreach my $rawline (@rawlines) {
 		$linenr++;
 		$line = $rawline;
@@ -2518,12 +2560,105 @@ sub process {
 
 			next;
 		}
-
 		$here .= "FILE: $realfile:$realline:" if ($realcnt != 0);
 
 		my $hereline = "$here\n$rawline\n";
 		my $herecurr = "$here\n$rawline\n";
 		my $hereprev = "$here\n$prevrawline\n$rawline\n";
+
+		if ($shorttext != AFTER_SHORTTEXT) {
+			if ($shorttext == IN_SHORTTEXT_BLANKLINE && $line=~/\S/) {
+				# the subject line was just processed,
+				# a blank line must be next
+				WARN("NONBLANK_AFTER_SUMMARY",
+				     "non-blank line after summary line\n" . $herecurr);
+				$shorttext = IN_SHORTTEXT;
+				# this non-blank line may or may not be commit text -
+				# a warning has been generated so assume it is commit
+				# text and move on
+				$commit_text_present = 1;
+				# fall through and treat this line as IN_SHORTTEXT
+			}
+			if ($shorttext == IN_SHORTTEXT) {
+				if ($line=~/^---/ || $line=~/^diff.*/) {
+					if ($commit_text_present == 0) {
+						WARN("NO_COMMIT_TEXT",
+						     "please add commit text explaining " .
+						     "*why* the change is needed\n" .
+						     $herecurr);
+					}
+					$shorttext = AFTER_SHORTTEXT;
+				} elsif ($line=~/^\s*change-id:/i ||
+					 $line=~/^\s*signed-off-by:/i ||
+					 $line=~/^\s*crs-fixed:/i ||
+					 $line=~/^\s*acked-by:/i) {
+					# this is a tag, there must be commit
+					# text by now
+					if ($commit_text_present == 0) {
+						WARN("NO_COMMIT_TEXT",
+						     "please add commit text explaining " .
+						     "*why* the change is needed\n" .
+						     $herecurr);
+						# prevent duplicate warnings
+						$commit_text_present = 1;
+					}
+				} elsif ($line=~/\S/) {
+					$commit_text_present = 1;
+				}
+			} elsif ($shorttext == IN_SHORTTEXT_BLANKLINE) {
+				# case of non-blank line in this state handled above
+				$shorttext = IN_SHORTTEXT;
+			} elsif ($shorttext == CHECK_NEXT_SHORTTEXT) {
+# The Subject line doesn't have to be the last header in the patch.
+# Avoid moving to the IN_SHORTTEXT state until clear of all headers.
+# Per RFC5322, continuation lines must be folded, so any left-justified
+# text which looks like a header is definitely a header.
+				if ($line!~/^[\x21-\x39\x3b-\x7e]+:/) {
+					$shorttext = IN_SHORTTEXT;
+					# Check for Subject line followed by a blank line.
+					if (length($line) != 0) {
+						WARN("NONBLANK_AFTER_SUMMARY",
+						     "non-blank line after " .
+						     "summary line\n" .
+						     $sublinenr . $here .
+						     "\n" . $subjectline .
+						     "\n" . $line . "\n");
+						# this non-blank line may or may not
+						# be commit text - a warning has been
+						# generated so assume it is commit
+						# text and move on
+						$commit_text_present = 1;
+					}
+				}
+			# The next two cases are BEFORE_SHORTTEXT.
+			} elsif ($line=~/^Subject: \[[^\]]*\] (.*)/) {
+				# This is the subject line. Go to
+				# CHECK_NEXT_SHORTTEXT to wait for the commit
+				# text to show up.
+				$shorttext = CHECK_NEXT_SHORTTEXT;
+				$subjectline = $line;
+				$sublinenr = "#$linenr & ";
+# Check for Subject line less than line limit
+				if (length($1) > SHORTTEXT_LIMIT && !($1 =~ m/Revert\ \"/)) {
+					WARN("LONG_SUMMARY_LINE",
+					     "summary line over " .
+					     SHORTTEXT_LIMIT .
+					     " characters\n" . $herecurr);
+				}
+			} elsif ($line=~/^    (.*)/) {
+				# Indented format, this must be the summary
+				# line (i.e. git show). There will be no more
+				# headers so we are now in the shorttext.
+				$shorttext = IN_SHORTTEXT_BLANKLINE;
+				$shorttext_exspc = 4;
+				if (length($1) > SHORTTEXT_LIMIT && !($1 =~ m/Revert\ \"/)) {
+					WARN("LONG_SUMMARY_LINE",
+					     "summary line over " .
+					     SHORTTEXT_LIMIT .
+					     " characters\n" . $herecurr);
+				}
+			}
+		}
 
 		$cnt_lines++ if ($realcnt != 0);
 
@@ -2649,7 +2784,7 @@ sub process {
 			$sig_nospace =~ s/\s//g;
 			$sig_nospace = lc($sig_nospace);
 			if (defined $signatures{$sig_nospace}) {
-				WARN("BAD_SIGN_OFF",
+				WARN("DUPLICATE_SIGN_OFF",
 				     "Duplicate signature\n" . $herecurr);
 			} else {
 				$signatures{$sig_nospace} = 1;
@@ -2664,10 +2799,10 @@ sub process {
 		}
 
 # Check for unwanted Gerrit info
-		if ($in_commit_log && $line =~ /^\s*change-id:/i) {
-			ERROR("GERRIT_CHANGE_ID",
-			      "Remove Gerrit Change-Id's before submitting upstream.\n" . $herecurr);
-		}
+#		if ($in_commit_log && $line =~ /^\s*change-id:/i) {
+#			ERROR("GERRIT_CHANGE_ID",
+#			      "Remove Gerrit Change-Id's before submitting upstream.\n" . $herecurr);
+#		}
 
 # Check if the commit log is in a possible stack dump
 		if ($in_commit_log && !$commit_log_possible_stack_dump &&
@@ -2679,10 +2814,10 @@ sub process {
 			$commit_log_possible_stack_dump = 1;
 		}
 
-# Check for line lengths > 75 in commit log, warn once
+# Check for line lengths > 120 in commit log, warn once
 		if ($in_commit_log && !$commit_log_long_line &&
-		    length($line) > 75 &&
-		    !($line =~ /^\s*[a-zA-Z0-9_\/\.]+\s+\|\s+\d+/ ||
+		    length($line) > 120 &&
+		    !($line =~ /^\s*[a-zA-Z0-9_\/\.\-\,]+\s+\|\s+\d+/ ||
 					# file delta changes
 		      $line =~ /^\s*(?:[\w\.\-]+\/)++[\w\.\-]+:/ ||
 					# filename then :
@@ -2690,7 +2825,7 @@ sub process {
 					# A Fixes: or Link: line
 		      $commit_log_possible_stack_dump)) {
 			WARN("COMMIT_LOG_LONG_LINE",
-			     "Possible unwrapped commit description (prefer a maximum 75 chars per line)\n" . $herecurr);
+			     "Possible unwrapped commit description (prefer a maximum 120 chars per line)\n" . $herecurr);
 			$commit_log_long_line = 1;
 		}
 
@@ -2752,24 +2887,24 @@ sub process {
 			($id, $description) = git_commit_info($orig_commit,
 							      $id, $orig_desc);
 
-			if (defined($id) &&
-			   ($short || $long || $space || $case || ($orig_desc ne $description) || !$hasparens)) {
-				ERROR("GIT_COMMIT_ID",
-				      "Please use git commit description style 'commit <12+ chars of sha1> (\"<title line>\")' - ie: '${init_char}ommit $id (\"$description\")'\n" . $herecurr);
-			}
+#			if (defined($id) &&
+#			   ($short || $long || $space || $case || ($orig_desc ne $description) || !$hasparens)) {
+#				ERROR("GIT_COMMIT_ID",
+#				      "Please use git commit description style 'commit <12+ chars of sha1> (\"<title line>\")' - ie: '${init_char}ommit $id (\"$description\")'\n" . $herecurr);
+#			}
 		}
 
 # Check for added, moved or deleted files
-		if (!$reported_maintainer_file && !$in_commit_log &&
-		    ($line =~ /^(?:new|deleted) file mode\s*\d+\s*$/ ||
-		     $line =~ /^rename (?:from|to) [\w\/\.\-]+\s*$/ ||
-		     ($line =~ /\{\s*([\w\/\.\-]*)\s*\=\>\s*([\w\/\.\-]*)\s*\}/ &&
-		      (defined($1) || defined($2))))) {
-			$is_patch = 1;
-			$reported_maintainer_file = 1;
-			WARN("FILE_PATH_CHANGES",
-			     "added, moved or deleted file(s), does MAINTAINERS need updating?\n" . $herecurr);
-		}
+#		if (!$reported_maintainer_file && !$in_commit_log &&
+#		    ($line =~ /^(?:new|deleted) file mode\s*\d+\s*$/ ||
+#		     $line =~ /^rename (?:from|to) [\w\/\.\-]+\s*$/ ||
+#		     ($line =~ /\{\s*([\w\/\.\-]*)\s*\=\>\s*([\w\/\.\-]*)\s*\}/ &&
+#		      (defined($1) || defined($2))))) {
+#			$is_patch = 1;
+#			$reported_maintainer_file = 1;
+#			WARN("FILE_PATH_CHANGES",
+#			     "added, moved or deleted file(s), does MAINTAINERS need updating?\n" . $herecurr);
+#		}
 
 # Check for wrappage within a valid hunk of the file
 		if ($realcnt != 0 && $line !~ m{^(?:\+|-| |\\ No newline|$)}) {
@@ -2983,7 +3118,7 @@ sub process {
 				$compat2 =~ s/\,[a-zA-Z0-9]*\-/\,<\.\*>\-/;
 				my $compat3 = $compat;
 				$compat3 =~ s/\,([a-z]*)[0-9]*\-/\,$1<\.\*>\-/;
-				`grep -Erq "$compat|$compat2|$compat3" $dt_path`;
+				`grep -ERq "$compat|$compat2|$compat3" $dt_path`;
 				if ( $? >> 8 ) {
 					WARN("UNDOCUMENTED_DT_STRING",
 					     "DT compatible string \"$compat\" appears un-documented -- check $dt_path\n" . $herecurr);
@@ -3072,6 +3207,10 @@ sub process {
 
 			# URL ($rawline is used in case the URL is in a comment)
 			} elsif ($rawline =~ /^\+.*\b[a-z][\w\.\+\-]*:\/\/\S+/i) {
+				$msg_type = "";
+
+			# Long copyright statements are another special case
+			} elsif ($rawline =~ /^\+.\*.*copyright.*\(c\).*$/i) {
 				$msg_type = "";
 
 			# Otherwise set the alternate message types
@@ -3741,6 +3880,12 @@ sub process {
 			}
 		}
 
+# avoid VENDOR_EDIT
+		if ($rawline =~ /\bVENDOR_EDIT\b/) {
+			WARN("VENDOR_EDIT",
+			     "Please remove VENDOR_EDIT before you commit it\n" . $herecurr);
+		}
+
 #
 # Checks which are anchored on the added line.
 #
@@ -3987,18 +4132,18 @@ sub process {
 		}
 
 # avoid BUG() or BUG_ON()
-		if ($line =~ /\b(?:BUG|BUG_ON)\b/) {
-			my $msg_level = \&WARN;
-			$msg_level = \&CHK if ($file);
-			&{$msg_level}("AVOID_BUG",
-				      "Avoid crashing the kernel - try using WARN_ON & recovery code rather than BUG() or BUG_ON()\n" . $herecurr);
-		}
+#		if ($line =~ /\b(?:BUG|BUG_ON)\b/) {
+#			my $msg_level = \&WARN;
+#			$msg_level = \&CHK if ($file);
+#			&{$msg_level}("AVOID_BUG",
+#				      "Avoid crashing the kernel - try using WARN_ON & recovery code rather than BUG() or BUG_ON()\n" . $herecurr);
+#		}
 
 # avoid LINUX_VERSION_CODE
-		if ($line =~ /\bLINUX_VERSION_CODE\b/) {
-			WARN("LINUX_VERSION_CODE",
-			     "LINUX_VERSION_CODE should be avoided, code should be for the version to which it is merged\n" . $herecurr);
-		}
+#if ($line =~ /\bLINUX_VERSION_CODE\b/) {
+#			WARN("LINUX_VERSION_CODE",
+#			     "LINUX_VERSION_CODE should be avoided, code should be for the version to which it is merged\n" . $herecurr);
+#		}
 
 # check for uses of printk_ratelimit
 		if ($line =~ /\bprintk_ratelimit\s*\(/) {
@@ -4613,7 +4758,7 @@ sub process {
 
 # check spacing on parentheses
 		if ($line =~ /\(\s/ && $line !~ /\(\s*(?:\\)?$/ &&
-		    $line !~ /for\s*\(\s+;/) {
+		    $line !~ /for\s*\(\s+;/ && $line !~ /^\+\s*[A-Z_][A-Z\d_]*\(\s*\d+(\,.*)?\)\,?$/) {
 			if (ERROR("SPACING",
 				  "space prohibited after that open parenthesis '('\n" . $herecurr) &&
 			    $fix) {
@@ -5010,7 +5155,7 @@ sub process {
 		if ($realfile !~ m@/vmlinux.lds.h$@ &&
 		    $line =~ /^.\s*\#\s*define\s*$Ident(\()?/) {
 			my $ln = $linenr;
-			my $cnt = $realcnt;
+			my $cnt = $realcnt - 1;
 			my ($off, $dstat, $dcond, $rest);
 			my $ctx = '';
 			my $has_flow_statement = 0;
@@ -5048,6 +5193,12 @@ sub process {
 			{
 			}
 
+			# Extremely long macros may fall off the end of the
+			# available context without closing.  Give a dangling
+			# backslash the benefit of the doubt and allow it
+			# to gobble any hanging open-parens.
+			$dstat =~ s/\(.+\\$/1/;
+
 			# Flatten any obvious string concatentation.
 			while ($dstat =~ s/($String)\s*$Ident/$1/ ||
 			       $dstat =~ s/$Ident\s*($String)/$1/)
@@ -5063,6 +5214,7 @@ sub process {
 				MODULE_PARM_DESC|
 				DECLARE_PER_CPU|
 				DEFINE_PER_CPU|
+				CLK_[A-Z\d_]+|
 				__typeof__\(|
 				union|
 				struct|
@@ -5469,6 +5621,67 @@ sub process {
 			     "Avoid line continuations in quoted strings\n" . $herecurr);
 		}
 
+# sys_open/read/write/close are not allowed in the kernel
+		if ($line =~ /\b(sys_(?:open|read|write|close))\b/) {
+			ERROR("FILE_OPS",
+			      "$1 is inappropriate in kernel code.\n" .
+			      $herecurr);
+		}
+
+# filp_open is a backdoor for sys_open
+		if ($line =~ /\b(filp_open)\b/) {
+			ERROR("FILE_OPS",
+			      "$1 is inappropriate in kernel code.\n" .
+			      $herecurr);
+		}
+
+# read[bwl] & write[bwl] use too many barriers, use the _relaxed variants
+		if ($line =~ /\b((?:read|write)[bwl])\b/) {
+			ERROR("NON_RELAXED_IO",
+			      "Use of $1 is deprecated: use $1_relaxed\n\t" .
+			      "with appropriate memory barriers instead.\n" .
+			      $herecurr);
+		}
+
+# likewise, in/out[bwl] should be __raw_read/write[bwl]...
+		if ($line =~ /\b((in|out)([bwl]))\b/) {
+			my ($all, $pref, $suf) = ($1, $2, $3);
+			$pref =~ s/in/read/;
+			$pref =~ s/out/write/;
+			ERROR("NON_RELAXED_IO",
+			      "Use of $all is deprecated: use " .
+			      "__raw_$pref$suf\n\t" .
+			      "with appropriate memory barriers instead.\n" .
+			      $herecurr);
+		}
+
+# dsb is too ARMish, and should usually be mb.
+		if ($line =~ /[^-_>*\.]\bdsb\b[^-_\.;]/) {
+			WARN("ARM_BARRIER",
+			     "Use of dsb is discouranged: prefer mb.\n" .
+			     $herecurr);
+		}
+
+# unbounded string functions are overflow risks
+		my %str_fns = (
+			"sprintf" => "snprintf",
+			"strcpy"  => "strlcpy",
+			"strncpy"  => "strlcpy",
+			"strcat"  => "strlcat",
+			"strncat"  => "strlcat",
+			"vsprintf"  => "vsnprintf",
+			"strchr" => "strnchr",
+			"strstr" => "strnstr",
+		);
+		foreach my $k (keys %str_fns) {
+			if ($line =~ /\b$k\b/) {
+				ERROR("UNBOUNDED_STRING_FNS",
+				      "Use of $k is deprecated: " .
+				      "use $str_fns{$k} instead.\n" .
+				      $herecurr);
+			}
+		}
+
 # warn about #if 0
 		if ($line =~ /^.\s*\#\s*if\s+0\b/) {
 			WARN("IF_0",
@@ -5672,6 +5885,12 @@ sub process {
 		if ($line =~ /\bget_jiffies_64\s*\(\s*\)\s*$Compare|$Compare\s*get_jiffies_64\s*\(\s*\)/) {
 			WARN("JIFFIES_COMPARISON",
 			     "Comparing get_jiffies_64() is almost always wrong; prefer time_after64, time_before64 and friends\n" . $herecurr);
+		}
+
+# check the patch for use of mdelay
+		if ($line =~ /\bmdelay\s*\(/) {
+			WARN("MDELAY",
+			     "use of mdelay() found: msleep() is the preferred API.\n" . $herecurr );
 		}
 
 # warn about #ifdefs in C files
@@ -6298,6 +6517,12 @@ sub process {
 
 			WARN("DEFAULT_NO_BREAK",
 			     "switch default: should use break\n" . $herectx);
+		}
+
+# check for return codes on error paths
+		if ($line =~ /\breturn\s+-\d+/) {
+			ERROR("NO_ERROR_CODE",
+			      "illegal return value, please use an error code\n" . $herecurr);
 		}
 
 # check for gcc specific __FUNCTION__

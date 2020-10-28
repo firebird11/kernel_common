@@ -615,7 +615,8 @@ try_again:
 		card->type = MMC_TYPE_SD_COMBO;
 
 		if (oldcard && (oldcard->type != MMC_TYPE_SD_COMBO ||
-		    memcmp(card->raw_cid, oldcard->raw_cid, sizeof(card->raw_cid)) != 0)) {
+		    memcmp(card->raw_cid, oldcard->raw_cid,
+					sizeof(card->raw_cid)) != 0)) {
 			mmc_remove_card(card);
 			return -ENOENT;
 		}
@@ -938,6 +939,7 @@ static int mmc_sdio_suspend(struct mmc_host *host)
 	cancel_delayed_work_sync(&host->sdio_irq_work);
 
 	mmc_claim_host(host);
+	mmc_log_string(host, "Enter\n");
 
 	if (mmc_card_keep_power(host) && mmc_card_wake_sdio_irq(host))
 		sdio_disable_wide(host->card);
@@ -949,6 +951,7 @@ static int mmc_sdio_suspend(struct mmc_host *host)
 		mmc_retune_needed(host);
 	}
 
+	mmc_log_string(host, "Exit\n");
 	mmc_release_host(host);
 
 	return 0;
@@ -960,6 +963,7 @@ static int mmc_sdio_resume(struct mmc_host *host)
 
 	/* Basic card reinitialization. */
 	mmc_claim_host(host);
+	mmc_log_string(host, "Enter\n");
 
 	/* Restore power if needed */
 	if (!mmc_card_keep_power(host)) {
@@ -999,6 +1003,7 @@ static int mmc_sdio_resume(struct mmc_host *host)
 	}
 
 out:
+	mmc_log_string(host, "Exit err: %d\n", err);
 	mmc_release_host(host);
 
 	host->pm_flags &= ~MMC_PM_KEEP_POWER;
